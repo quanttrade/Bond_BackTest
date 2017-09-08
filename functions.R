@@ -18,3 +18,8 @@ func_RebalanceDate <- function(startdate, enddate, interval = 'day', lagdays = 0
   
   return(RebalanceDate_)
 }
+
+#计算最大回撤
+maxDrawdown <- function(cumreturn){
+  round(cummin((1+cumreturn)/(1+cummax(cumreturn)) - 1), 3)
+}
