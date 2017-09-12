@@ -12,7 +12,8 @@
 # 仅在调仓日做调整，若调仓日无法卖出或买入，后续的时间不再进行补充的交易操作
 
 # 20170907更新说明
-# 方法一，相对方法二，在Total_Position的细节上的观察不太方便，主要用作测试，比对结果正确性
+# 方法二，相对方法一，在Total_Position的细节上的观察更方便
+
 
 #### load libraries   ####
 library(dplyr)
@@ -23,6 +24,7 @@ library(rJava)
 library(RJDBC)
 library(zoo)
 library(ggplot2)
+library(reshape2)
 
 #### set path ####
 jdbc_path <- "C:/Users/shuorui.zhang/Documents/R_WORKING_DIR/jdbc driver/sqljdbc_6.0/enu/jre8/sqljdbc42.jar"
@@ -40,8 +42,8 @@ Interval_Backtest <- 'day' #调仓周期，日调仓
 TRCost <- 0 #交易成本设置为0，暂时不考虑交易成本
 Cash_Initial <- 1000000 #初始资金设定
 Trade_Ratio <- 0.95 #资金当中的可投资百分比，即每次调仓时，用于投资的资金比例
-Buy_Proportion <- 1 #买入时买入额占当天成交额的最大比例
-Sell_Proportion <- 1 #卖出时卖出额占当天成交额的最大比例 
+Buy_Proportion <- 0.2 #买入时买入额占当天成交额的最大比例
+Sell_Proportion <- 0.2 #卖出时卖出额占当天成交额的最大比例 
 
 #### set signal info ####
 Signal_Series <- 'Contrarian'
@@ -108,26 +110,34 @@ for(cursor in 1:nrow(RebalanceDate_Backtest)){
   SellDate_ <- RebalanceDate_Backtest$SellDate[cursor]
   
   BondQuote_Cut_ <- BondQuote_Cut_All %>% filter(TradingDay %in% c(TradeDate_,SellDate_)) 
-  #裁剪行情数据，加速回测,包含BuyDate、SellDate两天行情，关联时需要关联Date
+  #裁剪行情数据，加速回测,包含TradeDate、SellDate两天行情，关联时需要关联TradingDay
   
   if(cursor ==1 ){#第一期单独处理
     Real_Position[[cursor]] <- Signal_Total %>% filter(Date==TradeDate_) %>% 
       left_join(BondQuote_Cut_, by = c('InnerCode','Date'='TradingDay')) %>% #关联上当日行情计算购买量
-      #Asset为根据Weight分配的资金，Shares为根据收盘价买入后持有的股数
-      mutate(Target_Asset = Weight*Cash_Initial*Trade_Ratio, #目标买入金额
-             TurnoverValue = ifelse(is.na(TurnoverValue),0,TurnoverValue), 
-             Buy_Ceiling = TurnoverValue*Buy_Proportion, #买入金额上限
-             Asset = ifelse(Buy_Ceiling>Target_Asset,Target_Asset,Buy_Ceiling)) %>% #实际能买入的金额
-      select(InnerCode,Date,Weight,Asset,everything()) %>% 
       mutate(SellDate=SellDate_) %>% #关联上SellDate的行情，以观察持仓期表现
       left_join(BondQuote_Cut_[c('InnerCode','TradingDay','ReturnDaily')], by = c('InnerCode','SellDate'='TradingDay')) %>%
-      rename(Return_Buy=ReturnDaily.x,Return_Sell=ReturnDaily.y)
+      rename(Return_Buy=ReturnDaily.x,Return_Sell=ReturnDaily.y) %>% 
+      mutate(Target_Asset  = Weight*Cash_Initial*Trade_Ratio, #目标买入金额
+             Asset_BfTrade = 0, #盘前资产
+             Asset_AtTrade = 0, #换仓时资产
+             Trade_Orders  = Target_Asset, #目标交易单
+             TurnoverValue = ifelse(is.na(TurnoverValue),0,TurnoverValue),
+             Buy_Ceiling   = TurnoverValue*Buy_Proportion, #买入金额上限
+             Actual_Buying = ifelse(Buy_Ceiling>Target_Asset,Target_Asset,Buy_Ceiling), #实际能买入的金额
+             Asset_AfTrade = Actual_Buying, #盘后资产
+             Asset_HoldTmr = Asset_AfTrade*(1+Return_Sell)) %>% 
+      select(Date,InnerCode,Weight,Target_Asset,Asset_BfTrade,Asset_AtTrade,Trade_Orders,
+             Asset_AfTrade,Asset_HoldTmr,everything()) 
     
-    Cash[cursor] <- Cash_Initial - sum(Real_Position[[cursor]]$Asset) #购买债券后的剩余资金
+    Cash[cursor] <- Cash_Initial - sum(Real_Position[[cursor]]$Asset_AfTrade) #购买债券后的剩余资金
     
   } else {#第二期开始
-    Prev_Position_ <- Real_Position[[cursor-1]] %>% arrange(InnerCode) 
-    Target_Position_ <- Signal_Total %>% filter(Date==TradeDate_) %>% arrange(InnerCode)
+    Prev_Position_ <- Real_Position[[cursor-1]] %>%
+      filter(Asset_AfTrade>0 | InnerCode=='AS0000')  #去掉前一期中已经卖出的债券
+    
+    Target_Position_ <- Signal_Total %>% filter(Date==TradeDate_) 
+    
     #前后两期持仓权重
     Position_Matrix <- rbind(distinct(Prev_Position_,InnerCode),distinct(Target_Position_,InnerCode)) %>% 
       distinct(InnerCode) %>% #前后两期所有债
@@ -138,69 +148,81 @@ for(cursor in 1:nrow(RebalanceDate_Backtest)){
     
     if(sum(Position_Matrix$Weight_LT!=Position_Matrix$Weight)==0){
       #如果后一期持仓权重和前一期相同，则不调仓，只对已有持仓的价值进行重新评估
-      Real_Position[[cursor]] <- Prev_Position_[c('InnerCode','Asset','Weight')] %>%
-        mutate(Date=TradeDate_) %>%
-        left_join(BondQuote_Cut_, by = c('InnerCode','Date'='TradingDay')) %>% #关联上当日行情，对于PR债，前收盘价已经调整
-        mutate(Asset=Asset*(1+ifelse(is.na(ReturnDaily),0,ReturnDaily))) %>% #计算当日资金收益
-        select(InnerCode,Date,Weight,Asset,everything()) %>%  #若当日不存在交易，则没有Buy_Ceiling
-        mutate(SellDate=SellDate_) %>% #关联上SellDate的行情，以观察持仓期表现
+      Real_Position[[cursor]]<- Prev_Position_ %>%
+        mutate(Date=TradeDate_,SellDate=SellDate_) %>% 
         left_join(BondQuote_Cut_[c('InnerCode','TradingDay','ReturnDaily')], by = c('InnerCode','SellDate'='TradingDay')) %>%
-        rename(Return_Buy=ReturnDaily.x,Return_Sell=ReturnDaily.y)
+        select(Date,SellDate,InnerCode,SecuCode,SecuAbbr,Weight,
+               Asset_BfTrade = Asset_AfTrade,
+               Asset_AtTrade = Asset_HoldTmr,
+               Return_Buy    = Return_Sell,
+               Return_Sell   = ReturnDaily) %>%
+        mutate(Trade_Orders  = 0,
+               Actual_Buying = 0,
+               IfDelisted    = ifelse(is.na(SecuCode)&(InnerCode!='AS0000'),1,0), #是否退市，若当天关联不到，代表上一期退市
+               Asset_AtTrade = ifelse(IfDelisted==0,Asset_AtTrade,Asset_BfTrade), #处理退市债券
+               Asset_AfTrade = ifelse(IfDelisted==0,Asset_AtTrade,0),
+               Asset_HoldTmr = Asset_AfTrade*(1+Return_Sell),
+               Target_Asset  = (sum(Asset_AtTrade, na.rm=T)+Cash[cursor-1])*Trade_Ratio*Weight
+        )
       
-      Cash[cursor] <- Cash[cursor-1]
+      if(sum(Real_Position[[cursor]]$IfDelisted)==0){
+        Cash[cursor] <- Cash[cursor-1]
+      } else{
+        #若退市，则退市资金进入Cash
+        Cash[cursor] <- Cash[cursor-1] + sum((Real_Position[[cursor]] %>% filter(IfDelisted==1))$Asset_AtTrade)
+      }
+      
+      Real_Position[[cursor]] <- Real_Position[[cursor]] %>% select(-IfDelisted)
       
     } else{#如果后一期持仓权重和前一期不同，则进行调仓
       #先计算调仓时的总资产，然后按照总资金按权重进行分配，得到目标持仓
       #最后根据目标持仓和原来持仓的差额进行先卖后买
-      Prev_Position_Today <- Prev_Position_[c('InnerCode','Weight','Asset')] %>% 
-        mutate(Date=TradeDate_) %>% select(InnerCode,Date,everything()) %>% #日期更改为当期日期，用于关联当期行情
-        left_join(BondQuote_Cut_, by = c('InnerCode','Date'='TradingDay')) %>% 
-        mutate(Asset=Asset*(1+ifelse(is.na(ReturnDaily),0,ReturnDaily))) 
       
-      Asset_Cap <- sum(Prev_Position_Today$Asset) + Cash[cursor-1] #调仓日调仓时的总资金(实际能使用的要再乘Trade_Ratio)
-      
-      Target_Position_Asset <- Target_Position_ %>% mutate(Target_Asset=Weight*Asset_Cap*Trade_Ratio) #根据调仓时的资产计算出的目标持仓
-      
-      Sell_Side <- Position_Matrix %>% 
-        left_join(Prev_Position_Today[c('InnerCode','Asset')], by = 'InnerCode') %>% 
-        mutate(Date=TradeDate_) %>%
-        mutate(Asset=ifelse(is.na(Asset),0,Asset)) %>%
-        rename(Asset_LT=Asset) %>% #上一期持仓到调仓时的市值
-        left_join(Target_Position_Asset[c('InnerCode','Target_Asset')], by = 'InnerCode') %>% #调仓时的目标持仓市值
-        mutate(Target_Asset=ifelse(is.na(Target_Asset),0,Target_Asset)) %>%
-        mutate(Trade_Orders=Target_Asset-Asset_LT) %>% #实际需要交易的差额形成的交易单
-        mutate(LongShort = ifelse(Trade_Orders>0,1,ifelse(Trade_Orders<0,-1,0))) %>%
+      Real_Position[[cursor]]<- Position_Matrix %>% 
+        left_join(Prev_Position_[c('InnerCode','Asset_AfTrade','Asset_HoldTmr')], by = 'InnerCode') %>%
+        rename(Asset_BfTrade = Asset_AfTrade, Asset_AtTrade = Asset_HoldTmr) %>% 
+        mutate(Asset_BfTrade = ifelse(is.na(Asset_BfTrade),0,Asset_BfTrade),
+               Asset_AtTrade = ifelse(is.na(Asset_AtTrade),0,Asset_AtTrade)) %>%
+        mutate(Date=TradeDate_,SellDate=SellDate_) %>%
         left_join(BondQuote_Cut_, by = c('InnerCode','Date'='TradingDay')) %>% #关联调仓日行情
+        mutate(IfDelisted    = ifelse(is.na(SecuCode)&(InnerCode!='AS0000'),1,0), #是否退市，若当天关联不到，代表上一期退市
+               Asset_AtTrade = ifelse(IfDelisted==0,Asset_AtTrade,Asset_BfTrade)) %>% #处理退市债券
+        mutate(Target_Asset = Weight*(sum(Asset_AtTrade, na.rm =T)+Cash[cursor-1])*Trade_Ratio) %>% #调仓时的目标持仓市值
+        mutate(Trade_Orders = Target_Asset - Asset_AtTrade) %>% #实际需要交易的差额形成的交易单
+        mutate(LongShort = ifelse(Trade_Orders>0,1,ifelse(Trade_Orders<0,-1,0))) %>% 
         mutate(TurnoverValue=ifelse(is.na(TurnoverValue),0,TurnoverValue),
                Sell_Ceiling = TurnoverValue*Sell_Proportion,
                Buy_Ceiling = TurnoverValue*Buy_Proportion) %>%
         mutate(Actual_Selling = ifelse(Sell_Ceiling>=abs(Trade_Orders),-Trade_Orders,Sell_Ceiling)*ifelse(LongShort==-1,1,0)) %>%#实际卖出额
-        mutate(Cash_Remain = (sum(Asset_LT) + Cash[cursor-1])*(1-Trade_Ratio),
+        mutate(Actual_Selling = ifelse(IfDelisted==0,Actual_Selling,Asset_AtTrade)) %>% #处理已退市股票，退市T+1日全部卖出
+        mutate(Cash_Remain = (sum(Asset_AtTrade) + Cash[cursor-1])*(1-Trade_Ratio),
                Cash_Usable = Cash[cursor-1] + sum(Actual_Selling) - Cash_Remain) %>% #卖出后可用的资金总额
         mutate(Cash_Usable = ifelse(Cash_Usable>=0,Cash_Usable,0)) %>%
         mutate(AnyLong = sum(LongShort>0),
                Buy_Weight = ifelse(AnyLong>0,ifelse(Trade_Orders>0,Trade_Orders,0)/sum(Trade_Orders[Trade_Orders>0]),0),
                Cash_AlloToBuy = Cash_Usable * Buy_Weight) %>%
         mutate(Actual_Buying = ifelse(Buy_Ceiling>Cash_AlloToBuy, Cash_AlloToBuy, Buy_Ceiling)) %>%
-        mutate(Asset=Asset_LT-Actual_Selling+Actual_Buying) %>%
+        mutate(Asset_AfTrade=Asset_AtTrade-Actual_Selling+Actual_Buying) %>%
         mutate(SellDate=SellDate_) %>%
         left_join(BondQuote_Cut_[c('InnerCode','TradingDay','ReturnDaily')], by = c('InnerCode','SellDate'='TradingDay')) %>%
-        rename(Return_Buy=ReturnDaily.x,Return_Sell=ReturnDaily.y)
+        rename(Return_Buy=ReturnDaily.x,Return_Sell=ReturnDaily.y) %>%
+        mutate(Asset_HoldTmr = Asset_AfTrade*(1+Return_Sell)) 
       
-      Real_Position[[cursor]] <- Sell_Side %>% filter(Asset>0 | InnerCode=='AS0000') #剔除不持仓的债券
-      
-      
-      Cash[cursor] <- Asset_Cap - sum(Real_Position[[cursor]]$Asset) #调仓日剩余现金
+      Cash[cursor] <- sum(Real_Position[[cursor]]$Asset_AtTrade, na.rm =T) + Cash[cursor-1] - 
+        sum(Real_Position[[cursor]]$Asset_AfTrade) #调仓日剩余现金
       
     }
   }
 }
 
-# source('test.R',encoding='UTF-8')
-# test()
 
 #合并每期的持仓
-Total_Positions <- bind_rows(Real_Position) 
+Total_Positions <- bind_rows(Real_Position) %>%
+  select(Date,SellDate,InnerCode,SecuCode,SecuAbbr,Weight_LT,Weight,Asset_BfTrade,Asset_AtTrade,Target_Asset,Trade_Orders,Actual_Selling,
+         Cash_AlloToBuy,Actual_Buying,Asset_AfTrade,Asset_HoldTmr,Return_Buy,Return_Sell,LongShort,Sell_Ceiling,Buy_Ceiling,
+         everything()) %>%
+  mutate(IfHold = ifelse(Asset_AfTrade>0 | InnerCode=='AS0000', 1, 0)) #是否是当期持仓的标志，若为0，则当期已全部卖出
+
 
 #合并资金曲线,并计算最大回撤
 Total_Asset <- Total_Positions %>%  group_by(Date) %>% summarise(Asset_Securities = sum(Asset_AfTrade,na.rm=T)) %>% 
@@ -217,15 +239,75 @@ IR <- Total_Asset %>% arrange(Date) %>%
   summarise(Years = round(as.numeric(EndDate_Backtest - StartDate_Backtest, units='days')/365, 2),
             denominator = round(sqrt(250), 4),
             AnnualizedReturn = round((Asset_Total[n()]/Asset_Total[1])^(1/Years) - 1, 4),
-            AnnualizedVol = round(sd(Term_Return)*denominator,4)
-  ) %>%
+            AnnualizedVol = round(sd(Term_Return)*denominator,4)) %>%
   mutate(IR = round(AnnualizedReturn/AnnualizedVol, 2))
 
+##绘图
 Graph_Total_Asset <- ggplot(data = Total_Asset)+
   geom_line(aes(x=Date, y= Asset_Total/Asset_Total[1]))+
   labs(title = '累计收益曲线',
        x = 'Time Line',
        y = 'Cumulative Return')
+
+##目标持仓和真实持仓的偏差
+Total_Miss <-Total_Positions %>% filter(InnerCode != 'AS0000') %>% 
+  mutate(IfTarget=ifelse(ceiling(Target_Asset/100)>0,1,0)) %>% #是否是目标持仓的标志,1是0否
+  mutate(Diff=Asset_AfTrade-Target_Asset) %>% #偏差=真实-目标
+  group_by(Date,SellDate,IfTarget) %>%
+  summarise(Total_Diff=sum(abs(Diff),na.rm=T)) %>%
+  left_join(Total_Asset, by = 'Date') %>%
+  mutate(MissRate=Total_Diff/Asset_Total) %>% #偏差绝对值占当期总资产的比重
+  select(Date,SellDate,IfTarget,Total_Diff,Asset_Securities,Cash,Asset_Total,MissRate) %>% ungroup
+
+Miss_InSide <- Total_Miss %>% filter(IfTarget==1) %>% 
+  select(Date,IfTarget,Total_Diff,MissRate) %>%
+  right_join(Total_Asset, by = 'Date') %>%
+  mutate(Total_Diff = ifelse(is.na(Total_Diff),0,Total_Diff),
+         MissRate = ifelse(is.na(MissRate),0,MissRate),
+         IfTarget = ifelse(is.na(IfTarget),1,IfTarget)
+  )
+
+Miss_OutSide <- Total_Miss %>% filter(IfTarget==0) %>% 
+  select(Date,IfTarget,Total_Diff,MissRate) %>%
+  right_join(Total_Asset, by = 'Date') %>%
+  mutate(Total_Diff = ifelse(is.na(Total_Diff),0,Total_Diff),
+         MissRate = ifelse(is.na(MissRate),0,MissRate),
+         IfTarget = ifelse(is.na(IfTarget),0,IfTarget)
+  )
+
+#绘图
+Graph_Position_Miss <- ggplot(data = Miss_InSide) +
+  geom_line(aes(x=Date, y = MissRate,colour="In"), show.legend = TRUE) +
+  geom_line(data = Miss_OutSide, aes(x=Date,y=MissRate, colour="Out"), show.legend = TRUE) +
+  ylim(0, 1) +
+  labs(title = 'Holdings Positions Bias(Real vs Target)',
+       x = 'TimeLine',
+       y = 'Holding Bias Rate')+
+  theme(legend.position = 'right')+
+  scale_colour_manual(name = 'Side' , values=c('In'='blue','Out'='red'))
+
+##每期目标持仓数量与实际持仓数量（债券种类）的差别
+Total_Positions %>% filter(Date=='2017-05-16',Asset_AfTrade>0) %>% group_by()
+
+Real_Species<- Total_Positions %>% filter(IfHold==1) %>% group_by(Date) %>% summarise(N_Real=n()-1)
+Target_Species <- Signal_Total %>% group_by(Date) %>% summarise(N_Tar=n()-1)
+Species_Diff<- Real_Species %>% inner_join(Target_Species, by ='Date') %>% mutate(N_Diff = N_Real - N_Tar)
+
+#绘图
+Graph_Species_Diff <- ggplot(data=melt(Species_Diff, id=('Date'), variable.name='Group', value.name='N'))+
+  geom_line(aes(x=Date,y=N,colour=Group))+
+  labs(title = 'Holding Species Difference',
+       x ='Date',
+       y = 'Number')
+
+##盈亏来源分析
+
+
+
+
+
+
+
 
 ####  output results   ####
 # Path_BacktestResult <- paste0('BacktestResult/', Signal_Series, '/', Signal_Name, "/", Sys.Date(), "_", format(Sys.time(), "%H%M%S"))

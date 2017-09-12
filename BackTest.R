@@ -162,11 +162,11 @@ for(cursor in 1:nrow(RebalanceDate_Backtest)){
 Total_Positions <- bind_rows(Real_Position) 
 
 #合并资金曲线,并计算最大回撤
-Total_Asset <- Total_Positions %>%  group_by(Date) %>% summarise(Asset_Securities = sum(Asset)) %>% 
+Total_Asset <- Total_Positions %>%  group_by(Date) %>% summarise(Asset_Securities = sum(Asset_AfTrade,na.rm=T)) %>% 
   select(Date,Asset_Securities) %>% ungroup %>% 
   arrange(Date) %>% cbind(.,Cash) %>% #关联上现金
   mutate(Asset_Total = Asset_Securities + Cash) %>% 
-  mutate(MaxDD = maxDrawdown(Asset_Total)) %>% #计算最大回撤
+  mutate(MaxDD = maxDrawdown(Asset_Total/Asset_Total[1]-1)) %>% #计算最大回撤
   #计算当日收益
   mutate(prev_Asset = lag(Asset_Total), Term_Return = Asset_Total/prev_Asset -1, Term_Return=ifelse(is.na(Term_Return),0,Term_Return))%>%
   select(-prev_Asset)
