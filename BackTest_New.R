@@ -16,6 +16,11 @@
 # 按照真实情况逐步处理，将几种不同类型的交易分开以此处理
 # 先考察是否有非目标持仓的券，若有，则先处理这些券，再看是否调仓日，若是则进行调仓，否则不调仓，仅处理非目标持仓券。
 
+# 20170921更新说明
+# BondFuture.R构造出国债期货主力合约行情及久期，用主力合约进行利率风险的对冲
+# 需要导入主力合约行情数据FutMainQuote.csv
+# 总收益还是未引入期货前的收益，即不包括国债期货对冲收益
+
 
 #### load libraries ####
 library(dplyr)
@@ -47,16 +52,25 @@ Trade_Ratio <- 0.95 #资金当中的可投资百分比，即每次调仓时，�
 Buy_Proportion <- 0.2 #买入时买入额占当天成交额的最大比例
 Sell_Proportion <- 0.2 #卖出时卖出额占当天成交额的最大比例
 Weight_eps <- 1e-6 #计算Weight和0的差距的临界值
+FutType <- 'TT' #选择对冲的国债期货品种，TT是十年期，TF是五年期
+Margin <- ifelse(FutType=='TT', 0.02, 0.01) #国债期货的保证金比例，暂时没用
 
 #### set signal info ####
 Signal_Series <- 'Contrarian'
-Signal_Name <- 'Signal_Contrarian_5pct'
+Signal_Name <- 'Contrarian_AvgDiff_1pct'
 
 #### load functions ####
 source('functions.R', encoding = 'UTF-8')
 
 #### load data ####
 load(paste0(load_path,"/QT_TradingDayNew_DB.RData"))
+FutMainQuote <- read_csv('FutMainQuote.csv') %>% 
+  data.frame() %>% 
+  filter(ContractType == FutType) %>%
+  arrange(TradingDay) %>%
+  mutate(PrevDuration = dplyr::lag(Duration)) %>%
+  mutate(CumReturn = cumprod(1+DailyReturn)/(1+DailyReturn[1]) - 1) %>% #国债期货的累计收益
+  select(TradingDay,ContractCode,DailyReturn,CumReturn,PrevDuration) 
 
 #### main ####
 #rebalance date#
@@ -83,7 +97,8 @@ Signal_Total <- rbind(Signal_Raw, Signal_Assist) %>% arrange(Date)
 #读入行情数据#
 # BondQuote_Orig <- dbGetQuery(conn,paste0("SELECT t2.SecuCode,t.InnerCode,t2.SecuAbbr,t.TradingDay,t.PrevClosePrice,t.ClosePrice,t.OpenPrice
 #                                          ,t.LowPrice,t.HighPrice,t.TurnoverValue,t.TurnoverVolume,t.TurnoverDeals,
-#                                          t1.BondTypeLevel1Desc AS BondType, t1.BondNature, t4.IssuerNature, t3.ValueCleanPrice
+#                                          t1.BondTypeLevel1Desc AS BondType, t1.BondNature, t4.IssuerNature,
+#                                          t3.ValueCleanPrice,t3.VPADuration as Duration
 #                                          FROM jydb.dbo.QT_DailyQuote t
 #                                          LEFT JOIN jybond.dbo.Bond_Code t1
 #                                          ON t.InnerCode=t1.InnerCode
@@ -104,7 +119,11 @@ Signal_Total <- rbind(Signal_Raw, Signal_Assist) %>% arrange(Date)
 BondQuote_Cut_All <- BondQuote_Orig %>% filter(InnerCode %in% distinct(Signal_Total,InnerCode)$InnerCode) %>%
   mutate(ReturnDaily=ClosePrice/PrevClosePrice-1) %>% 
   select(-OpenPrice,-LowPrice,-HighPrice,-TurnoverVolume,-TurnoverDeals,-PrevClosePrice,-ClosePrice,
-         -BondType,-ValueCleanPrice,-BondNature,-IssuerNature) #减少字段，方便代码编写及结果查看
+         -BondType,-ValueCleanPrice,-BondNature,-IssuerNature) %>% #减少字段，方便代码编写及结果查看
+  group_by(SecuCode) %>%
+  arrange(SecuCode,TradingDay) %>%
+  mutate(PrevDuration = dplyr::lag(Duration)) %>% #取前一天的修正久期
+  ungroup
 
 Cash <- NULL
 Real_Position <- NULL
@@ -113,7 +132,9 @@ for(cursor in 1:nrow(RebalanceDate_Backtest)){
   TradeDate_ <- RebalanceDate_Backtest$BuyDate[cursor]
   # SellDate_ <- RebalanceDate_Backtest$SellDate[cursor] #不是必需
   
-  BondQuote_Cut_ <- BondQuote_Cut_All %>% filter(TradingDay ==TradeDate_) 
+  BondQuote_Cut_ <- BondQuote_Cut_All %>% 
+    select(-Duration,-PrevDuration) %>% 
+    filter(TradingDay ==TradeDate_) 
   #裁剪行情数据，加速回测,若包含TradeDate、SellDate两天行情，关联时需要关联TradingDay
   
   if(cursor ==1){#第一期单独处理
@@ -243,8 +264,6 @@ for(cursor in 1:nrow(RebalanceDate_Backtest)){
   }
 }
 
-
-#### 回测分析 ####
 #合并每期的持仓
 Total_Positions <- bind_rows(Real_Position) %>%
   select(Date,InnerCode,SecuCode,SecuAbbr,Weight_LT,Weight,Asset_BfTrade,Asset_AtTrade,Target_Asset,Trade_Orders,Actual_Selling,
@@ -252,6 +271,31 @@ Total_Positions <- bind_rows(Real_Position) %>%
          everything()) %>%
   mutate(IfHold = ifelse(Asset_AfTrade>0 | InnerCode=='AS0000', 1, 0)) #是否是当期持仓的标志，若为0，则当期已全部卖出
 
+#### 粗糙的一种对冲 ####
+# 等持仓都出来后，按照每天交易后剩余的非目标持仓金额进行对冲，每天结算当日期货部分收益
+# 这样买卖的时候每次总资产的计算会略有偏差，因为没有计算期货对冲部分的收益
+# 但是相对的好处是比较容易计算，且容易设置是否对冲的开关
+# 债券和国债期货的Duration计算时都用前一天的Duration
+
+HedgeReturnAll <- Total_Positions %>% left_join(BondQuote_Cut_All[c('InnerCode','TradingDay','PrevDuration')],
+                                  by = c('InnerCode','Date'='TradingDay')) %>%
+  mutate(IfUnTarget = ifelse(Weight < Weight_eps, 1, 0)) %>%
+  group_by(Date) %>%
+  summarise(Untarget_Asset = sum(IfUnTarget*Asset_AfTrade, na.rm = T),
+            Avg_Duration = weighted.mean(PrevDuration, Asset_AfTrade, na.rm =T),
+            Avg_Duration = ifelse(is.nan(Avg_Duration),0,Avg_Duration )) %>%
+  ungroup() %>%
+  left_join(FutMainQuote, by = c('Date'='TradingDay')) %>%
+  arrange(Date) %>%
+  mutate(HedgeValue = Untarget_Asset*Avg_Duration/PrevDuration,
+         PrevHedgeValue = dplyr::lag(HedgeValue),
+         HedgeReturn = -PrevHedgeValue*DailyReturn,
+         HedgeReturn = ifelse(is.na(HedgeReturn),0,HedgeReturn)
+  ) %>%
+  mutate(CumHedgeReturn = cumsum(HedgeReturn)) 
+
+
+#### 回测分析 ####
 
 #合并资金曲线,并计算最大回撤
 Total_Asset <- Total_Positions %>%  group_by(Date) %>% summarise(Asset_Securities = sum(Asset_AfTrade,na.rm=T)) %>% 
@@ -390,13 +434,16 @@ Graph_Total_Asset_Target <- ggplot(melt(Total_PnL[c('Date','Total_Target_PnL','T
        x ='Date',
        y = 'Profit')
 
+# 此处引入期货有所不同
 Graph_Total_Asset_Mixed <- ggplot(melt(Total_PnL[c('Date','Total_Target_PnL','Total_NonTarget_PnL')], id = 'Date', variable.name ='IfTarget', value.name = 'Profit'))+
   geom_line(aes(x=Date,y=Profit/Cash_Initial,colour=IfTarget),size=1)+
   geom_line(data=Total_Asset,aes(x=Date, y= (Asset_Total-Cash_Initial)/Cash_Initial,colour='Total'),size=1.5)+
+  geom_line(data=HedgeReturnAll,aes(x=Date,y=(CumHedgeReturn/Cash_Initial),colour='Future'))+
+  geom_line(data=FutMainQuote,aes(x=TradingDay,y=CumReturn,colour='FutureIndex'))+
   theme(legend.position = 'bottom')+
   labs(title = 'Cumulative Return (Mixed)',
        x ='Date',
-       y = 'Profit')
+       y = 'Cumulative Return')
 
 
 ####  output results   ####
@@ -411,8 +458,8 @@ BackTest_Info <- paste0("Signal Series: ", Signal_Series, "\n",
                         "Rebalance Interval: ", Interval_Backtest, "\n",
                         "Initial Cash: ", Cash_Initial, "\n",
                         "Trade Ratio: ", Trade_Ratio, "\n",
-                        "Buy Proportion", Buy_Proportion, "\n",
-                        "Sell Proportion", Sell_Proportion, "\n")
+                        "Buy Proportion: ", Buy_Proportion, "\n",
+                        "Sell Proportion: ", Sell_Proportion, "\n")
 
 write(BackTest_Info, file = paste0(Path_BacktestResult, paste0("/BackTest_Info_",Interval_Backtest,".txt")))
 
